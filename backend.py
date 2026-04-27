@@ -3,203 +3,167 @@ from flask_cors import CORS
 import pickle
 import os
 import re
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from difflib import get_close_matches
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
 import requests
 
-# Load API key securely from environment variable
 API_KEY = os.getenv("OMDB_API_KEY")
 
 app = Flask(__name__)
 CORS(app)
 
-# Safe file paths (important for deployment)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 df = pickle.load(open(os.path.join(BASE_DIR, "movies.pkl"), "rb"))
-tfidf_matrix = pickle.load(open(os.path.join(BASE_DIR, "tfidf.pkl"), "rb"))
+NEIGHBOURS = pickle.load(open(os.path.join(BASE_DIR, "neighbours.pkl"), "rb"))
+print(f"Neighbour lookup loaded ({len(NEIGHBOURS)} entries).", flush=True)
 
-numeric_matrix = df[["averageRating", "numVotes", "runtimeMinutes"]].fillna(0).to_numpy()
-numeric_matrix = StandardScaler().fit_transform(numeric_matrix)
+TITLES_LOWER = df['primaryTitle'].str.lower().str.strip().tolist()
+_rec_cache: dict = {}
 
-@lru_cache(maxsize=256)
-def get_movie_details(title):
+
+@lru_cache(maxsize=512)
+def get_movie_details(title: str) -> dict:
+    _default = {
+        "poster": "https://placehold.co/200x300/1a1a1a/666?text=No+Poster",
+        "rating": "N/A", "director": "N/A", "actors": "N/A",
+        "released": "N/A", "genre": "N/A", "boxoffice": "N/A"
+    }
     if not API_KEY:
-        return {
-            "poster": "https://via.placeholder.com/150",
-            "rating": "N/A",
-            "director": "N/A",
-            "actors": "N/A",
-            "released": "N/A",
-            "genre": "N/A",
-            "boxoffice": "N/A"
-        }
-
+        return _default
     try:
-        url = f"http://www.omdbapi.com/?t={title}&apikey={API_KEY}"
-        response = requests.get(url, timeout=3)
-        data = response.json()
+        url = f"http://www.omdbapi.com/?t={requests.utils.quote(title)}&apikey={API_KEY}"
+        resp = requests.get(url, timeout=4)
+        data = resp.json()
+        if data.get("Response") != "True":
+            return _default
 
-        if data.get("Response", "False") != "True":
-            raise ValueError("OMDB lookup failed")
+        poster = data.get("Poster") or ""
+        if poster in ("", "N/A"):
+            poster = _default["poster"]
 
-        poster = data.get("Poster", "")
-        if poster == "N/A":
-            poster = "https://via.placeholder.com/150"
-
-        rating = data.get("imdbRating", "N/A")
-        director = data.get("Director", "N/A")
         actors = data.get("Actors", "N/A")
-        released = data.get("Released", "N/A")
-        genre = data.get("Genre", "N/A")
-        boxoffice = data.get("BoxOffice", "N/A")
-
         if actors != "N/A":
             actors = ", ".join(actors.split(",")[:3])
 
         return {
-            "poster": poster,
-            "rating": rating,
-            "director": director,
-            "actors": actors,
-            "released": released,
-            "genre": genre,
-            "boxoffice": boxoffice
+            "poster":    poster,
+            "rating":    data.get("imdbRating", "N/A"),
+            "director":  data.get("Director",   "N/A"),
+            "actors":    actors,
+            "released":  data.get("Released",   "N/A"),
+            "genre":     data.get("Genre",      "N/A"),
+            "boxoffice": data.get("BoxOffice",  "N/A"),
         }
-
     except Exception:
-        return {
-            "poster": "https://via.placeholder.com/150",
-            "rating": "N/A",
-            "director": "N/A",
-            "actors": "N/A",
-            "released": "N/A",
-            "genre": "N/A",
-            "boxoffice": "N/A"
-        }
+        return _default
 
-def _find_movie_index(title):
+
+def _find_movie_index(title: str):
     title = title.strip().lower()
 
-    exact_matches = df[df['primaryTitle'].str.lower().str.strip() == title]
-    if not exact_matches.empty:
-        return exact_matches.sort_values(
-            by=['numVotes', 'averageRating'], ascending=False
+    exact_rows = df[[t == title for t in TITLES_LOWER]]
+    if not exact_rows.empty:
+        return exact_rows.sort_values(
+            by=["numVotes", "averageRating"], ascending=False
         ).index[0]
 
-    contains = df[df['primaryTitle'].str.lower().str.contains(re.escape(title), na=False)]
-    if not contains.empty:
-        starts = contains[contains['primaryTitle'].str.lower().str.startswith(title)]
-        if not starts.empty:
-            return starts.sort_values(
-                by=['numVotes', 'averageRating'], ascending=False
-            ).index[0]
-        return contains.sort_values(
-            by=['numVotes', 'averageRating'], ascending=False
+    contains_rows = df[[title in t for t in TITLES_LOWER]]
+    if not contains_rows.empty:
+        starts = contains_rows[
+            [TITLES_LOWER[i].startswith(title) for i in contains_rows.index]
+        ]
+        pool = starts if not starts.empty else contains_rows
+        return pool.sort_values(
+            by=["numVotes", "averageRating"], ascending=False
         ).index[0]
 
-    close = get_close_matches(title, df['primaryTitle'].str.lower().tolist(), n=1, cutoff=0.55)
+    close = get_close_matches(title, TITLES_LOWER, n=1, cutoff=0.55)
     if close:
-        match = df[df['primaryTitle'].str.lower() == close[0]]
+        match = df[[t == close[0] for t in TITLES_LOWER]]
         if not match.empty:
             return match.index[0]
 
     return None
 
 
-def recommend(title):
+def recommend(title: str) -> list:
+    key = title.strip().lower()
+    print(f"[1] recommend() called: '{key}'", flush=True)
+
+    if key in _rec_cache:
+        print(f"[2] Cache hit — returning instantly", flush=True)
+        return _rec_cache[key]
+
+    t1 = time.time()
     idx = _find_movie_index(title)
+    print(f"[2] Title matching: {time.time()-t1:.2f}s  idx={idx}", flush=True)
+
     if idx is None:
         return []
 
-    # 🔹 Text similarity (PRIMARY signal)
-    tfidf_scores = cosine_similarity(
-        tfidf_matrix[idx:idx+1], tfidf_matrix
-    ).flatten()
+    t2 = time.time()
+    neighbour_indices = NEIGHBOURS.get(idx, [])
+    print(f"[3] Neighbour lookup: {time.time()-t2:.2f}s  found={len(neighbour_indices)}", flush=True)
 
-    # 🔹 Get input movie genres when available
-    genres_column = 'genres' if 'genres' in df.columns else None
-
-    if genres_column:
-        input_genres = str(df[genres_column].iloc[idx])
-        candidate_indices = [
-            i for i in range(len(df))
-            if i != idx and any(
-                g.strip() in str(df[genres_column].iloc[i])
-                for g in input_genres.split(',')
-                if g.strip()
-            )
-        ]
-    else:
-        candidate_indices = [i for i in range(len(df)) if i != idx]
-
-    # 🔹 Rank candidates using similarity + quality boost
-    ranked = sorted(
-        candidate_indices,
-        key=lambda i: (
-            0.85 * tfidf_scores[i] +                      # similarity
-            0.10 * df['averageRating'].iloc[i] +          # rating boost (scaled values)
-            0.05 * max(df['numVotes'].iloc[i], 0)         # popularity boost (scaled values)
-        ),
-        reverse=True
-    )
-
-    # 🔹 Final filtering (remove garbage)
-    top_indices = [
-        i for i in ranked
-        if df['numVotes'].iloc[i] > 0 and df['averageRating'].iloc[i] > 0
-    ]
-
+    votes   = df['numVotes'].to_numpy()
+    ratings = df['averageRating'].to_numpy()
+    top_indices = [i for i in neighbour_indices if votes[i] > 0 and ratings[i] > 0][:5]
     if not top_indices:
-        top_indices = ranked[:5]
-    else:
-        top_indices = top_indices[:5]
+        top_indices = neighbour_indices[:5]
+    print(f"[4] Top indices: {top_indices}", flush=True)
 
+    t3 = time.time()
     results = []
-
-    with ThreadPoolExecutor(max_workers=min(5, len(top_indices))) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {
             executor.submit(get_movie_details, df['primaryTitle'].iloc[i]): i
             for i in top_indices
         }
         for future in as_completed(futures):
             i = futures[future]
-            movie_title = df['primaryTitle'].iloc[i]
             details = future.result()
+            print(f"[5] OMDB done for: {df['primaryTitle'].iloc[i]}", flush=True)
             results.append({
-                "title": movie_title,
-                "poster": details["poster"],
-                "rating": details["rating"],
-                "director": details["director"],
-                "actors": details["actors"],
-                "released": details["released"],
-                "genre": details["genre"],
-                "boxoffice": details["boxoffice"]
+                "title":     df['primaryTitle'].iloc[i],
+                "poster":    details["poster"],
+                "rating":    details["rating"],
+                "director":  details["director"],
+                "actors":    details["actors"],
+                "released":  details["released"],
+                "genre":     details["genre"],
+                "boxoffice": details["boxoffice"],
             })
+    print(f"[6] OMDB total: {time.time()-t3:.2f}s", flush=True)
 
+    _rec_cache[key] = results
     return results
+
 
 @app.route("/recommend", methods=["POST", "OPTIONS"])
 def recommend_api():
+    print("REQUEST RECEIVED", flush=True)
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
     data = request.get_json()
+    print(f"JSON parsed: {data}", flush=True)
 
     if not data or "movie" not in data:
         return jsonify({"error": "No movie provided"}), 400
 
-    movie = data["movie"]
     try:
-        results = recommend(movie)
+        results = recommend(data["movie"])
     except Exception as e:
         return jsonify({"error": "Server error", "details": str(e)}), 500
 
     return jsonify(results)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
