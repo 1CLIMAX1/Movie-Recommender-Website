@@ -152,8 +152,11 @@ def recommend(title):
 
     return results
 
-@app.route("/recommend", methods=["POST"])
+@app.route("/recommend", methods=["POST", "OPTIONS"])
 def recommend_api():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
     data = request.get_json()
 
     if not data or "movie" not in data:
