@@ -23,6 +23,12 @@ TITLES_LOWER = movies_data["titles_lower"]
 VOTES = movies_data["votes"]
 RATINGS = movies_data["ratings"]
 
+EXACT_TITLE_INDEX = {}
+for i, title_lower in enumerate(TITLES_LOWER):
+    current = EXACT_TITLE_INDEX.get(title_lower)
+    if current is None or (VOTES[i], RATINGS[i]) > (VOTES[current], RATINGS[current]):
+        EXACT_TITLE_INDEX[title_lower] = i
+
 with open(os.path.join(BASE_DIR, "neighbours_data.pkl"), "rb") as f:
     neighbours_data = pickle.load(f)
 
@@ -83,19 +89,11 @@ def get_movie_details(title: str) -> dict:
 def _find_movie_index(title: str):
     t = title.strip().lower()
 
-    exact_index = None
-    candidates = []
-
-    for i, title_lower in enumerate(TITLES_LOWER):
-        if title_lower == t:
-            exact_index = i
-            break
-        if t in title_lower:
-            candidates.append(i)
-
+    exact_index = EXACT_TITLE_INDEX.get(t)
     if exact_index is not None:
         return exact_index
 
+    candidates = [i for i, title_lower in enumerate(TITLES_LOWER) if t in title_lower]
     if candidates:
         starts = [i for i in candidates if TITLES_LOWER[i].startswith(t)]
         pool = starts if starts else candidates
@@ -103,10 +101,7 @@ def _find_movie_index(title: str):
 
     close = get_close_matches(t, TITLES_LOWER, n=1, cutoff=0.55)
     if close:
-        match = close[0]
-        for i, title_lower in enumerate(TITLES_LOWER):
-            if title_lower == match:
-                return i
+        return EXACT_TITLE_INDEX.get(close[0])
 
     return None
 
