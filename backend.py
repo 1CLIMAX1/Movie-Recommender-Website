@@ -104,17 +104,21 @@ def recommend(title):
         tfidf_matrix[idx:idx+1], tfidf_matrix
     ).flatten()
 
-    # 🔹 Get input movie genres
-    input_genres = str(df['genres'].iloc[idx])
+    # 🔹 Get input movie genres when available
+    genres_column = 'genres' if 'genres' in df.columns else None
 
-    # 🔹 Filter by similar genres
-    candidate_indices = [
-        i for i in range(len(df))
-        if i != idx and any(
-            g.strip() in str(df['genres'].iloc[i])
-            for g in input_genres.split(',')
-        )
-    ]
+    if genres_column:
+        input_genres = str(df[genres_column].iloc[idx])
+        candidate_indices = [
+            i for i in range(len(df))
+            if i != idx and any(
+                g.strip() in str(df[genres_column].iloc[i])
+                for g in input_genres.split(',')
+                if g.strip()
+            )
+        ]
+    else:
+        candidate_indices = [i for i in range(len(df)) if i != idx]
 
     # 🔹 Rank candidates using similarity + quality boost
     ranked = sorted(
@@ -163,7 +167,10 @@ def recommend_api():
         return jsonify({"error": "No movie provided"}), 400
 
     movie = data["movie"]
-    results = recommend(movie)
+    try:
+        results = recommend(movie)
+    except Exception as e:
+        return jsonify({"error": "Server error", "details": str(e)}), 500
 
     return jsonify(results)
 
