@@ -139,6 +139,10 @@ def recommend(title: str) -> list:
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
+@app.route("/ping")
+def ping():
+    return "ok", 200
+
 @app.route("/recommend", methods=["POST", "OPTIONS"])
 def recommend_api():
     if request.method == "OPTIONS":
