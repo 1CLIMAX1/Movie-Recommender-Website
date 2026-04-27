@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pickle
 import os
+import re
+from difflib import get_close_matches
 from sklearn.metrics.pairwise import cosine_similarity
 import requests
 
@@ -58,18 +60,42 @@ def get_movie_details(title):
             "boxoffice": "N/A"
         }
 
+def _find_movie_index(title):
+    title = title.strip().lower()
+
+    exact_matches = df[df['primaryTitle'].str.lower().str.strip() == title]
+    if not exact_matches.empty:
+        return exact_matches.sort_values(
+            by=['numVotes', 'averageRating'], ascending=False
+        ).index[0]
+
+    contains = df[df['primaryTitle'].str.lower().str.contains(re.escape(title), na=False)]
+    if not contains.empty:
+        starts = contains[contains['primaryTitle'].str.lower().str.startswith(title)]
+        if not starts.empty:
+            return starts.sort_values(
+                by=['numVotes', 'averageRating'], ascending=False
+            ).index[0]
+        return contains.sort_values(
+            by=['numVotes', 'averageRating'], ascending=False
+        ).index[0]
+
+    close = get_close_matches(title, df['primaryTitle'].str.lower().tolist(), n=1, cutoff=0.55)
+    if close:
+        match = df[df['primaryTitle'].str.lower() == close[0]]
+        if not match.empty:
+            return match.index[0]
+
+    return None
+
+
 def recommend(title):
-    title = title.lower()
-
-    matches = df[df['primaryTitle'].str.lower().str.contains(title, na=False)]
-
-    if matches.empty:
+    idx = _find_movie_index(title)
+    if idx is None:
         return []
 
-    idx = matches.index[0]
-
-    sim_scores = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).flatten()
-    sim_indices = sim_scores.argsort()[::-1][1:6]
+    sim_scores = cosine_similarity(tfidf_matrix[idx:idx+1], tfidf_matrix).flatten()
+    sim_indices = [i for i in sim_scores.argsort()[::-1] if i != idx][:5]
 
     results = []
 
