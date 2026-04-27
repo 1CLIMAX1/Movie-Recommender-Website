@@ -1,11 +1,12 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import pickle
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from difflib import get_close_matches
+import os
+import pickle
+
 import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 API_KEY = os.getenv("OMDB_API_KEY")
 
@@ -14,25 +15,31 @@ CORS(app)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ─── Load data once at startup ────────────────────────────────────────────────
-df         = pickle.load(open(os.path.join(BASE_DIR, "movies.pkl"), "rb"))
-NEIGHBOURS = pickle.load(open(os.path.join(BASE_DIR, "neighbours.pkl"), "rb"))
+with open(os.path.join(BASE_DIR, "movies_data.pkl"), "rb") as f:
+    movies_data = pickle.load(f)
 
-# ─── Pre-build lower-cased title list for fast matching ──────────────────────
-TITLES_LOWER = df['primaryTitle'].str.lower().str.strip().tolist()
+TITLES = movies_data["titles"]
+TITLES_LOWER = movies_data["titles_lower"]
+VOTES = movies_data["votes"]
+RATINGS = movies_data["ratings"]
 
-# ─── Pre-extract numpy arrays to avoid repeated .to_numpy() calls ─────────────
-VOTES   = df['numVotes'].to_numpy()
-RATINGS = df['averageRating'].to_numpy()
+with open(os.path.join(BASE_DIR, "neighbours_data.pkl"), "rb") as f:
+    neighbours_data = pickle.load(f)
 
-# ─── Result-level cache ───────────────────────────────────────────────────────
-_rec_cache: dict = {}
+NEIGHBOURS_OFFSETS = neighbours_data["offsets"]
+NEIGHBOURS_FLAT = neighbours_data["flat"]
 
-print(f"Ready — {len(NEIGHBOURS)} movies indexed.", flush=True)
+print(f"Ready — {len(TITLES)} movies indexed.", flush=True)
+
+
+def _get_neighbours(idx: int):
+    start = NEIGHBOURS_OFFSETS[idx]
+    end = NEIGHBOURS_OFFSETS[idx + 1]
+    return NEIGHBOURS_FLAT[start:end]
 
 
 # ─── OMDB ─────────────────────────────────────────────────────────────────────
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=128)
 def get_movie_details(title: str) -> dict:
     _default = {
         "poster":    "https://placehold.co/200x300/1a1a1a/666?text=No+Poster",
@@ -76,65 +83,67 @@ def get_movie_details(title: str) -> dict:
 def _find_movie_index(title: str):
     t = title.strip().lower()
 
-    # 1. Exact
-    exact = df[[s == t for s in TITLES_LOWER]]
-    if not exact.empty:
-        return exact.sort_values(by=["numVotes", "averageRating"], ascending=False).index[0]
+    exact_index = None
+    candidates = []
 
-    # 2. Contains / starts-with
-    contains = df[[t in s for s in TITLES_LOWER]]
-    if not contains.empty:
-        starts = contains[[TITLES_LOWER[i].startswith(t) for i in contains.index]]
-        pool   = starts if not starts.empty else contains
-        return pool.sort_values(by=["numVotes", "averageRating"], ascending=False).index[0]
+    for i, title_lower in enumerate(TITLES_LOWER):
+        if title_lower == t:
+            exact_index = i
+            break
+        if t in title_lower:
+            candidates.append(i)
 
-    # 3. Fuzzy fallback
+    if exact_index is not None:
+        return exact_index
+
+    if candidates:
+        starts = [i for i in candidates if TITLES_LOWER[i].startswith(t)]
+        pool = starts if starts else candidates
+        return max(pool, key=lambda i: (VOTES[i], RATINGS[i]))
+
     close = get_close_matches(t, TITLES_LOWER, n=1, cutoff=0.55)
     if close:
-        match = df[[s == close[0] for s in TITLES_LOWER]]
-        if not match.empty:
-            return match.index[0]
+        match = close[0]
+        for i, title_lower in enumerate(TITLES_LOWER):
+            if title_lower == match:
+                return i
 
     return None
 
 
 # ─── Recommendation logic ─────────────────────────────────────────────────────
+@lru_cache(maxsize=128)
 def recommend(title: str) -> list:
     key = title.strip().lower()
-    if key in _rec_cache:
-        return _rec_cache[key]
-
     idx = _find_movie_index(title)
     if idx is None:
         return []
 
-    neighbours = NEIGHBOURS.get(idx, [])
-
+    neighbours = _get_neighbours(idx)
     top = [i for i in neighbours if VOTES[i] > 0 and RATINGS[i] > 0][:5]
     if not top:
         top = neighbours[:5]
 
     results = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(get_movie_details, df['primaryTitle'].iloc[i]): i
+            executor.submit(get_movie_details, TITLES[i]): i
             for i in top
         }
         for future in as_completed(futures):
-            i       = futures[future]
+            i = futures[future]
             details = future.result()
             results.append({
-                "title":     df['primaryTitle'].iloc[i],
-                "poster":    details["poster"],
-                "rating":    details["rating"],
-                "director":  details["director"],
-                "actors":    details["actors"],
-                "released":  details["released"],
-                "genre":     details["genre"],
+                "title": TITLES[i],
+                "poster": details["poster"],
+                "rating": details["rating"],
+                "director": details["director"],
+                "actors": details["actors"],
+                "released": details["released"],
+                "genre": details["genre"],
                 "boxoffice": details["boxoffice"],
             })
 
-    _rec_cache[key] = results
     return results
 
 
