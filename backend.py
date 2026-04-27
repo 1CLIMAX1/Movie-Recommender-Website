@@ -99,14 +99,43 @@ def recommend(title):
     if idx is None:
         return []
 
-    tfidf_scores = cosine_similarity(tfidf_matrix[idx:idx+1], tfidf_matrix).flatten()
-    numeric_scores = cosine_similarity(numeric_matrix[idx:idx+1], numeric_matrix).flatten()
-    sim_scores = 0.75 * tfidf_scores + 0.25 * numeric_scores
-    sim_indices = [i for i in sim_scores.argsort()[::-1] if i != idx][:5]
+    # 🔹 Text similarity (PRIMARY signal)
+    tfidf_scores = cosine_similarity(
+        tfidf_matrix[idx:idx+1], tfidf_matrix
+    ).flatten()
+
+    # 🔹 Get input movie genres
+    input_genres = str(df['genres'].iloc[idx])
+
+    # 🔹 Filter by similar genres
+    candidate_indices = [
+        i for i in range(len(df))
+        if i != idx and any(
+            g.strip() in str(df['genres'].iloc[i])
+            for g in input_genres.split(',')
+        )
+    ]
+
+    # 🔹 Rank candidates using similarity + quality boost
+    ranked = sorted(
+        candidate_indices,
+        key=lambda i: (
+            0.85 * tfidf_scores[i] +                      # similarity
+            0.10 * (df['averageRating'].iloc[i] / 10) +   # rating boost
+            0.05 * np.log1p(df['numVotes'].iloc[i])       # popularity boost
+        ),
+        reverse=True
+    )
+
+    # 🔹 Final filtering (remove garbage)
+    top_indices = [
+        i for i in ranked
+        if df['numVotes'].iloc[i] > 1000 and df['averageRating'].iloc[i] > 5
+    ][:5]
 
     results = []
 
-    for i in sim_indices:
+    for i in top_indices:
         movie_title = df['primaryTitle'].iloc[i]
         details = get_movie_details(movie_title)
 
