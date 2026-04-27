@@ -4,7 +4,9 @@ import pickle
 import os
 import re
 from difflib import get_close_matches
+import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import StandardScaler
 import requests
 
 # Load API key securely from environment variable
@@ -18,6 +20,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 df = pickle.load(open(os.path.join(BASE_DIR, "movies.pkl"), "rb"))
 tfidf_matrix = pickle.load(open(os.path.join(BASE_DIR, "tfidf.pkl"), "rb"))
+
+numeric_matrix = df[["averageRating", "numVotes", "runtimeMinutes"]].fillna(0).to_numpy()
+numeric_matrix = StandardScaler().fit_transform(numeric_matrix)
 
 def get_movie_details(title):
     try:
@@ -94,7 +99,9 @@ def recommend(title):
     if idx is None:
         return []
 
-    sim_scores = cosine_similarity(tfidf_matrix[idx:idx+1], tfidf_matrix).flatten()
+    tfidf_scores = cosine_similarity(tfidf_matrix[idx:idx+1], tfidf_matrix).flatten()
+    numeric_scores = cosine_similarity(numeric_matrix[idx:idx+1], numeric_matrix).flatten()
+    sim_scores = 0.75 * tfidf_scores + 0.25 * numeric_scores
     sim_indices = [i for i in sim_scores.argsort()[::-1] if i != idx][:5]
 
     results = []
