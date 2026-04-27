@@ -3,6 +3,8 @@ from flask_cors import CORS
 import pickle
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from difflib import get_close_matches
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -24,11 +26,26 @@ tfidf_matrix = pickle.load(open(os.path.join(BASE_DIR, "tfidf.pkl"), "rb"))
 numeric_matrix = df[["averageRating", "numVotes", "runtimeMinutes"]].fillna(0).to_numpy()
 numeric_matrix = StandardScaler().fit_transform(numeric_matrix)
 
+@lru_cache(maxsize=256)
 def get_movie_details(title):
+    if not API_KEY:
+        return {
+            "poster": "https://via.placeholder.com/150",
+            "rating": "N/A",
+            "director": "N/A",
+            "actors": "N/A",
+            "released": "N/A",
+            "genre": "N/A",
+            "boxoffice": "N/A"
+        }
+
     try:
         url = f"http://www.omdbapi.com/?t={title}&apikey={API_KEY}"
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, timeout=3)
         data = response.json()
+
+        if data.get("Response", "False") != "True":
+            raise ValueError("OMDB lookup failed")
 
         poster = data.get("Poster", "")
         if poster == "N/A":
@@ -125,8 +142,8 @@ def recommend(title):
         candidate_indices,
         key=lambda i: (
             0.85 * tfidf_scores[i] +                      # similarity
-            0.10 * (df['averageRating'].iloc[i] / 10) +   # rating boost
-            0.05 * np.log1p(df['numVotes'].iloc[i])       # popularity boost
+            0.10 * df['averageRating'].iloc[i] +          # rating boost (scaled values)
+            0.05 * max(df['numVotes'].iloc[i], 0)         # popularity boost (scaled values)
         ),
         reverse=True
     )
@@ -134,25 +151,35 @@ def recommend(title):
     # 🔹 Final filtering (remove garbage)
     top_indices = [
         i for i in ranked
-        if df['numVotes'].iloc[i] > 1000 and df['averageRating'].iloc[i] > 5
-    ][:5]
+        if df['numVotes'].iloc[i] > 0 and df['averageRating'].iloc[i] > 0
+    ]
+
+    if not top_indices:
+        top_indices = ranked[:5]
+    else:
+        top_indices = top_indices[:5]
 
     results = []
 
-    for i in top_indices:
-        movie_title = df['primaryTitle'].iloc[i]
-        details = get_movie_details(movie_title)
-
-        results.append({
-            "title": movie_title,
-            "poster": details["poster"],
-            "rating": details["rating"],
-            "director": details["director"],
-            "actors": details["actors"],
-            "released": details["released"],
-            "genre": details["genre"],
-            "boxoffice": details["boxoffice"]
-        })
+    with ThreadPoolExecutor(max_workers=min(5, len(top_indices))) as executor:
+        futures = {
+            executor.submit(get_movie_details, df['primaryTitle'].iloc[i]): i
+            for i in top_indices
+        }
+        for future in as_completed(futures):
+            i = futures[future]
+            movie_title = df['primaryTitle'].iloc[i]
+            details = future.result()
+            results.append({
+                "title": movie_title,
+                "poster": details["poster"],
+                "rating": details["rating"],
+                "director": details["director"],
+                "actors": details["actors"],
+                "released": details["released"],
+                "genre": details["genre"],
+                "boxoffice": details["boxoffice"]
+            })
 
     return results
 
